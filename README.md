@@ -24,3 +24,14 @@ plugin window.
 - Pick a window to hide it if it's showing, or bring it back if it's hidden.
 - **Show all** / **Hide all** act on every window at once.
 - Every window's close (**X**) button hides it; it doesn't destroy it.
+
+## Prompt
+
+mush_windows also reads your in-game prompt for the other plugins, so they
+only ever depend on mush_windows, never on each other.
+
+- `wf_prompt_setup`: reads your prompt with `prompt settings`. Run it once,
+  and again after changing your prompt with `prompt set`. The prompt must
+  include `|XCOORD|` and `|YCOORD|`.
+- `wf_hide_coords` / `wf_show_coords`: hide or show the coordinate line in
+  your output. It's hidden by default.

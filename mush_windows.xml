@@ -8,6 +8,7 @@
    date_written="2026-09-12"
    requires="4.90"
    version="1.0"
+   save_state="y"
 >
 </plugin>
 
@@ -94,9 +95,40 @@
   area for that and nothing else.
 -->
 
+<!--
+  Prompt service: the one place that reads your in-game prompt, so plugins
+  that need your position (OertheMap, area_map, ...) depend only on this
+  plugin and never on each other.
+
+  wf_prompt_setup sends "prompt settings", reads back the template, and
+  turns every prompt line into a regex (saved to prompt_config.lua next to
+  this file). The line(s) holding |XCOORD| / |YCOORD| get a trigger; when
+  the last of them arrives, the prompt is over and this plugin calls
+  BroadcastPlugin(MW_BROADCAST_PROMPT, "x,y"). Consumers handle that in
+  OnPluginBroadcast (checking the id is this plugin's), both as their
+  position source and as "the game just finished a block of output".
+  MW_BROADCAST_PROMPT_CHANGED (text "") means the prompt was just re-read.
+
+  CallPlugin services (plain strings only, per the CallPlugin limit above):
+    MW_GetPosition()      -> "x,y" (either part empty while unknown)
+    MW_GetPromptLines()   -> every prompt line's regex joined with "\n",
+                             then a last line with the 1-based index of the
+                             line the broadcast fires on; "" if not set up
+    MW_PromptSetup()      -> same as typing wf_prompt_setup
+    MW_SetHideCoords(s)   -> "1" hides the coordinate line(s) from output,
+                             "0" shows them again
+-->
+<triggers>
+  <trigger name="mw_prompt_header" match="^Your prompt:$" enabled="y" regexp="y"
+           sequence="100" script="MwStartPromptCapture"></trigger>
+</triggers>
+
 <aliases>
   <alias name="wf_windows" match="^wf_windows$" enabled="y" regexp="y" sequence="100"
          omit_from_command_history="y" omit_from_log="y" omit_from_output="y" script="WfShowWindowsMenu"></alias>
+  <alias name="wf_prompt_setup" match="^wf_prompt_setup$" enabled="y" regexp="y" sequence="100" script="MW_PromptSetup"></alias>
+  <alias name="wf_hide_coords" match="^wf_hide_coords$" enabled="y" regexp="y" sequence="100" script="MwHideCoordsAlias"></alias>
+  <alias name="wf_show_coords" match="^wf_show_coords$" enabled="y" regexp="y" sequence="100" script="MwShowCoordsAlias"></alias>
 </aliases>
 
 <script>
@@ -209,8 +241,259 @@ function WF_Registry_Get(excludeId)
   return table.concat(parts, "|")
 end
 
+-- ---------------------------------------------------------------------------
+-- Prompt service (see the comment above <triggers>)
+-- ---------------------------------------------------------------------------
+
+MW_BROADCAST_PROMPT = 1
+MW_BROADCAST_PROMPT_CHANGED = 2
+
+local function Note(msg)
+  ColourNote("orange", "", "[mush_windows] " .. msg)
+end
+
+local function PluginDir()
+  local dir = GetPluginInfo(GetPluginID(), 20) or ""
+  if dir ~= "" and dir:sub(-1) ~= "/" and dir:sub(-1) ~= "\\" then
+    dir = dir .. "/"
+  end
+  return dir
+end
+
+local position = { x = nil, y = nil }
+local promptConfig = nil    -- { lines = { regex, ... }, coords = { { line=, pattern=, xGroup=, yGroup= }, ... } }
+local promptCapture = { active = false, lines = {} }
+local hideCoords = true
+local coordTriggerSpecs = {} -- trigger name -> coords entry
+
+local function EscapeRegex(s)
+  return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?{}|\\])", "\\%1"))
+end
+
+-- Converts one line of the |TOKEN| template into a regex.
+local function BuildLineRegex(line)
+  local pattern = "^"
+  local xGroup, yGroup = nil, nil
+  local groupIdx = 0
+  local pos = 1
+  while true do
+    local s, e, token = line:find("|([^|]-)|", pos)
+    if not s then
+      pattern = pattern .. EscapeRegex(line:sub(pos))
+      break
+    end
+    if s > pos then
+      pattern = pattern .. EscapeRegex(line:sub(pos, s - 1))
+    end
+    local ename = (token:match("^([^%*]+)") or token):lower()
+
+    if ename == "xcoord" then
+      groupIdx = groupIdx + 1
+      xGroup = groupIdx
+      pattern = pattern .. "(-?\\d+)"
+    elseif ename == "ycoord" then
+      groupIdx = groupIdx + 1
+      yGroup = groupIdx
+      pattern = pattern .. "(-?\\d+)"
+    elseif ename == "colour" or ename == "color" then
+      -- zero-width: assumes the trigger matches against colour-stripped text
+    elseif ename == "pipe" then
+      pattern = pattern .. "\\|"
+    elseif ename == "space" then
+      pattern = pattern .. " "
+    else
+      pattern = pattern .. ".*?"
+    end
+    pos = e + 1
+  end
+  return pattern .. "$", xGroup, yGroup
+end
+
+-- The game hard-wraps long output at a fixed column width, which can split
+-- a |TOKEN| in half across two physical lines -- without dropping or
+-- adding any characters, so the fix is to rejoin everything into one
+-- continuous string before looking for |NEWLINE| tokens, rather than
+-- trusting physical line boundaries.
+local function SplitOnNewlineToken(text)
+  local logicalLines = {}
+  local pos = 1
+  while true do
+    local s, e = text:find("|NEWLINE|", pos, true)
+    if not s then
+      logicalLines[#logicalLines + 1] = text:sub(pos)
+      break
+    end
+    logicalLines[#logicalLines + 1] = text:sub(pos, s - 1)
+    pos = e + 1
+  end
+  return logicalLines
+end
+
+local function InstallCoordTriggers()
+  for name in pairs(coordTriggerSpecs) do
+    DeleteTrigger(name)
+  end
+  coordTriggerSpecs = {}
+  if not promptConfig then return end
+
+  -- flags: enabled(1) + regexp(32) + replace-if-exists(1024) = 1057,
+  -- plus omit-from-output(4) when the coordinate line should be hidden.
+  local flags = 1057 + (hideCoords and 4 or 0)
+  for i, spec in ipairs(promptConfig.coords) do
+    local name = "mw_coord_" .. i
+    AddTriggerEx(name, spec.pattern, "", flags, -1, 0, "", "MwOnCoordLine", 0, 100)
+    coordTriggerSpecs[name] = spec
+    spec.isLast = (i == #promptConfig.coords)
+  end
+end
+
+local function SavePromptConfig()
+  local path = PluginDir() .. "prompt_config.lua"
+  local f, err = io.open(path, "w")
+  if not f then
+    Note("could not save prompt_config.lua: " .. tostring(err))
+    return
+  end
+  f:write("-- Auto-generated by wf_prompt_setup from your 'prompt settings' output.\n")
+  f:write("return {\n  lines = {\n")
+  for _, pattern in ipairs(promptConfig.lines) do
+    f:write(string.format("    %q,\n", pattern))
+  end
+  f:write("  },\n  coords = {\n")
+  for _, spec in ipairs(promptConfig.coords) do
+    f:write(string.format("    { line = %d, pattern = %q, xGroup = %s, yGroup = %s },\n",
+      spec.line, spec.pattern, tostring(spec.xGroup), tostring(spec.yGroup)))
+  end
+  f:write("  },\n}\n")
+  f:close()
+end
+
+local function LoadPromptConfig()
+  local chunk = loadfile(PluginDir() .. "prompt_config.lua")
+  if not chunk then return false end
+  local ok, cfg = pcall(chunk)
+  if not ok or type(cfg) ~= "table" or not cfg.lines or not cfg.coords or #cfg.coords == 0 then
+    return false
+  end
+  promptConfig = cfg
+  InstallCoordTriggers()
+  return true
+end
+
+function MW_PromptSetup()
+  Note("requesting your prompt format...")
+  Send("prompt settings")
+  return true
+end
+
+function MwStartPromptCapture()
+  promptCapture.active = true
+  promptCapture.lines = {}
+  MwResetPromptTimer()
+end
+
+function MwResetPromptTimer()
+  DeleteTimer("mw_prompt_done")
+  -- flags: enabled(1) + one-shot(4) = 5
+  AddTimer("mw_prompt_done", 0, 0, 0.4, "", 5, "MwFinishPromptCapture")
+end
+
+function MwFinishPromptCapture()
+  promptCapture.active = false
+  local lines = promptCapture.lines
+
+  if #lines == 0 then
+    Note("got no template lines back from 'prompt settings' -- is a custom prompt active? " ..
+      "(try 'prompt set |HP|:|SP|>|NEWLINE|X:[|XCOORD|]Y:[|YCOORD|]' first)")
+    return
+  end
+
+  local logicalLines = SplitOnNewlineToken(table.concat(lines, ""))
+  -- A template ending in |NEWLINE| leaves an empty logical line after it,
+  -- which the game never actually prints.
+  if #logicalLines > 1 and logicalLines[#logicalLines] == "" then
+    logicalLines[#logicalLines] = nil
+  end
+
+  local cfg = { lines = {}, coords = {} }
+  for i, line in ipairs(logicalLines) do
+    local pattern, xGroup, yGroup = BuildLineRegex(line)
+    cfg.lines[i] = pattern
+    if xGroup or yGroup then
+      cfg.coords[#cfg.coords + 1] = { line = i, pattern = pattern, xGroup = xGroup, yGroup = yGroup }
+    end
+  end
+
+  if #cfg.coords == 0 then
+    Note("your prompt template doesn't contain |XCOORD| / |YCOORD|. " ..
+      "Add them with 'prompt set ...' and run wf_prompt_setup again.")
+    return
+  end
+
+  promptConfig = cfg
+  InstallCoordTriggers()
+  SavePromptConfig()
+  BroadcastPlugin(MW_BROADCAST_PROMPT_CHANGED, "")
+  Note("prompt read: " .. #cfg.lines .. " line(s), position from " .. #cfg.coords .. " of them.")
+end
+
+function OnPluginLineReceived(text)
+  if promptCapture.active and text ~= "Your prompt:" then
+    if text:find("|", 1, true) then
+      table.insert(promptCapture.lines, text)
+      MwResetPromptTimer()
+    else
+      -- Every line of the template has |TOKENS|; the first line without
+      -- any is the game's real prompt printed right after it, which must
+      -- not be read as more template.
+      DeleteTimer("mw_prompt_done")
+      MwFinishPromptCapture()
+    end
+  end
+  return true
+end
+
+function MwOnCoordLine(name, line, wildcards)
+  local spec = coordTriggerSpecs[name]
+  if not spec then return end
+  if spec.xGroup then position.x = tonumber(wildcards[spec.xGroup]) end
+  if spec.yGroup then position.y = tonumber(wildcards[spec.yGroup]) end
+  if spec.isLast then
+    BroadcastPlugin(MW_BROADCAST_PROMPT, MW_GetPosition())
+  end
+end
+
+function MW_GetPosition()
+  return (position.x or "") .. "," .. (position.y or "")
+end
+
+function MW_GetPromptLines()
+  if not promptConfig then return "" end
+  local last = promptConfig.coords[#promptConfig.coords].line
+  return table.concat(promptConfig.lines, "\n") .. "\n" .. last
+end
+
+function MW_SetHideCoords(state)
+  hideCoords = (state == "1" or state == true)
+  SetVariable("hide_coords", hideCoords and "1" or "0")
+  InstallCoordTriggers()
+  Note(hideCoords and "the coordinate line will now be hidden from your output."
+    or "the coordinate line will now be shown again.")
+  return true
+end
+
+function MwHideCoordsAlias() MW_SetHideCoords("1") end
+function MwShowCoordsAlias() MW_SetHideCoords("0") end
+
 function OnPluginInstall()
   ColourNote("orange", "", "[mush_windows] ready -- " .. MENU_KEY .. " opens the Windows menu.")
+
+  local savedHide = GetVariable("hide_coords")
+  if savedHide ~= nil then hideCoords = savedHide == "1" end
+  if not LoadPromptConfig() then
+    Note("prompt not read yet -- make sure your prompt includes |XCOORD| and |YCOORD| " ..
+      "(see 'help prompt'), then type: wf_prompt_setup")
+  end
 
   WindowCreate(MENU_ANCHOR, 0, 0, 1, 1, 12, ABSOLUTE_LOCATION + TRANSPARENT, 0x000000)
   WindowShow(MENU_ANCHOR, true)
