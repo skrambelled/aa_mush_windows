@@ -4,7 +4,7 @@
    author="Mark"
    id="26a4ca2758d503d86efe902e"
    language="Lua"
-   purpose="Shared window chrome (drag/resize/min/max/close/snap) plus a Windows list"
+   purpose="Shared window chrome (drag/resize/min/max/close/snap) plus a Windows menu"
    date_written="2026-09-12"
    requires="4.90"
    version="1.0"
@@ -17,8 +17,8 @@
   from any edge/corner, min/max/close buttons, persisted position/size,
   click-to-front, edge-snapping) to live on disk, so every other plugin
   in this set (OertheMap, and whatever comes after it) can load ONE
-  shared copy instead of bundling its own. (It also hosts one small
-  window of its own now — the Windows list, see further down.)
+  shared copy instead of bundling its own. (It also hosts the
+  Ctrl+Shift+W Windows menu, see further down.)
 
   Why a separate plugin, and not just a shared .lua file some other
   plugin happens to own: MUSHclient plugins are separate Lua VMs with no
@@ -77,151 +77,121 @@
   described above; see winframe.lua for the packed wire format and the
   actual snapping math.
 
-  mush_windows now has a window of its own after all: a small "Windows"
-  list/taskbar, built with the exact same winframe.lua every consumer
-  uses (mush_windows just loads its own local copy directly, no
-  IsPluginInstalled dance needed for that — it's right there on disk).
-  It lists every OTHER registered window by title, straight out of the
-  same registry table above (no CallPlugin needed for that half, since
-  the registry and the taskbar are the same script/Lua state); clicking
-  an entry, or its own close (X) button chrome now gives every window,
-  calls back OUT to whichever plugin owns that window (WinframeActivate/
-  WinframeHide, both installed by winframe.lua in every consumer) to
-  actually raise/restore or hide it — mush_windows only ever holds the
-  id, title and owning plugin id, never the real winframe instance.
+  Windows menu: instead of a floating window of its own, mush_windows
+  pops up a native menu (WindowMenu) listing every registered window by
+  title, straight out of the same registry table above. Ctrl+Shift+W
+  (or typing wf_windows) opens it. A check mark means the window is
+  showing; picking an entry hides a showing window, or brings a hidden
+  one back, by calling back OUT to whichever plugin owns that window
+  (WinframeActivate/WinframeHide, both installed by winframe.lua in
+  every consumer), since mush_windows only ever holds the id, title and
+  owning plugin id, never the real winframe instance.
+
+  MUSHclient gives plugins no way to add items to its own menu bar
+  (File/Edit/View/...), so a hotkey-driven popup is the closest
+  equivalent. WindowMenu has to be anchored to some miniwindow, so this
+  plugin keeps one invisible 1x1 window at the top-left of the output
+  area for that and nothing else.
 -->
 
 <aliases>
-  <alias name="wf_windows" match="^wf_windows$" enabled="y" regexp="y" sequence="100" script="WfShowWindows"></alias>
+  <alias name="wf_windows" match="^wf_windows$" enabled="y" regexp="y" sequence="100"
+         omit_from_command_history="y" omit_from_log="y" omit_from_output="y" script="WfShowWindowsMenu"></alias>
 </aliases>
 
 <script>
 <![CDATA[
 
-local winframe = assert(loadfile(GetPluginInfo(GetPluginID(), 20) .. "winframe.lua"))()
+local MENU_KEY = "Ctrl+Shift+W"
+local MENU_ANCHOR = "mush_windows_menu_anchor"
+local ABSOLUTE_LOCATION = 2   -- WindowCreate flag bits
+local TRANSPARENT = 4
 
 local windows = {}     -- winframe id -> { left, top, w, h, title, owner, visible }
-local taskbarWin = nil -- assigned in OnPluginInstall, read by the functions below
 
 -- ---------------------------------------------------------------------------
--- Windows list / taskbar
+-- Windows menu
 -- ---------------------------------------------------------------------------
 
-local ROW_H = 18
-local CLOSE_W = 16
-
--- Ordered (alphabetical by title), excluding the taskbar's own entry --
--- shared by drawing and hotspot setup so the two never drift apart, same
--- pattern OertheMap.xml uses for its own control layout.
-local function TaskbarRows()
+-- Ordered alphabetically by title, so the menu doesn't reshuffle between
+-- openings.
+local function SortedIds()
   local ids = {}
-  for id in pairs(windows) do
-    if id ~= taskbarWin.id then ids[#ids + 1] = id end
-  end
+  for id in pairs(windows) do ids[#ids + 1] = id end
   table.sort(ids, function(a, b)
     return (windows[a].title or a) < (windows[b].title or b)
   end)
-
-  local rows = {}
-  for i, id in ipairs(ids) do
-    local top = (i - 1) * ROW_H
-    rows[#rows + 1] = { id = id, rec = windows[id], top = top, bottom = top + ROW_H }
-  end
-  return rows
+  return ids
 end
 
-local function DrawTaskbar(contentW, contentH)
-  local top0 = taskbarWin:contentTop()
-  local rows = TaskbarRows()
+-- WindowMenu treats '|' as the item separator and a leading - + ^ ! > <
+-- as item flags, so keep titles from being misread as either.
+local function MenuLabel(title)
+  title = title:gsub("|", "/")
+  if title:match("^[-+^!<>]") then title = " " .. title end
+  return title
+end
 
-  if #rows == 0 then
-    WindowText(taskbarWin.win, taskbarWin.titleFontId, "(no windows yet)",
-      4, top0 + 2, contentW - 4, top0 + ROW_H, 0x888888, false)
+local SHOW_ALL, HIDE_ALL = "Show all", "Hide all"
+
+function WfShowWindowsMenu()
+  local ids = SortedIds()
+  local items, labels = {}, {}
+  for i, id in ipairs(ids) do
+    local rec = windows[id]
+    labels[i] = MenuLabel(rec.title or id)
+    items[i] = (rec.visible and "+" or "") .. labels[i]
+  end
+  if #ids == 0 then
+    items[1] = "^(no windows yet)"
+  else
+    items[#items + 1] = "-"
+    items[#items + 1] = SHOW_ALL
+    items[#items + 1] = HIDE_ALL
+  end
+
+  -- WindowMenu returns the chosen item's text ("" if dismissed). Strip any
+  -- check/disabled flag in case it comes back with the text, then match it
+  -- against what we built; two windows with the same title resolve to the
+  -- first one.
+  -- The point has to fall inside the anchor window: MUSHclient silently
+  -- returns "" without showing anything for a point outside it.
+  local choice = (WindowMenu(MENU_ANCHOR, 0, 0, table.concat(items, "|")) or ""):gsub("^[+^]+", "")
+  if choice == "" or #ids == 0 then return end
+
+  local function act(id, show)
+    local rec = windows[id]
+    if rec and rec.owner then
+      pcall(CallPlugin, rec.owner, show and "WinframeActivate" or "WinframeHide", id)
+    end
+  end
+
+  if choice == SHOW_ALL or choice == HIDE_ALL then
+    for _, id in ipairs(ids) do act(id, choice == SHOW_ALL) end
     return
   end
-
-  local closeL = contentW - CLOSE_W
-  for _, row in ipairs(rows) do
-    local textColour = row.rec.visible and 0xFFFFFF or 0x888888
-    WindowText(taskbarWin.win, taskbarWin.titleFontId, row.rec.title or row.id,
-      4, top0 + row.top + 2, closeL - 2, top0 + row.bottom, textColour, false)
-    WindowText(taskbarWin.win, taskbarWin.titleFontId, "x",
-      closeL, top0 + row.top + 2, contentW - 4, top0 + row.bottom, 0xAAAAAA, false)
-  end
-end
-
-local function TaskbarHotspots(contentW, contentH)
-  local top0 = taskbarWin:contentTop()
-  local closeL = contentW - CLOSE_W
-  for _, row in ipairs(TaskbarRows()) do
-    WindowAddHotspot(taskbarWin.win, "mw_row_" .. row.id,
-      0, top0 + row.top, closeL, top0 + row.bottom,
-      "", "", "MwTaskbarRowMouseDown", "", "",
-      "Bring to front", miniwin.cursor_hand, 0)
-    WindowAddHotspot(taskbarWin.win, "mw_close_" .. row.id,
-      closeL, top0 + row.top, contentW, top0 + row.bottom,
-      "", "", "MwTaskbarCloseMouseDown", "", "",
-      "Hide", miniwin.cursor_hand, 0)
-  end
-end
-
--- Called on every registry write, including the ones the taskbar's OWN
--- winframe instance triggers on itself (syncGeometry, throttled, during a
--- live drag/resize of the taskbar's own title bar/edges). A plain
--- taskbarWin:redraw() would call setupHotspots() -> WindowDeleteAllHotspots
--- there too, deleting the very "zz_drag"/resize hotspot that gesture is
--- currently tracked on and silently ending it after the first throttled
--- tick -- the exact bug this same pattern already caused (and was fixed)
--- in oerthe_map's own pan-drag, just triggered a different way here: only
--- dragging the TASKBAR loops back onto itself like this; dragging some
--- OTHER window's title bar only ever refreshes the taskbar's ROW LIST
--- content, never its own hotspots, since the window doing the dragging
--- and the window being refreshed are different windows in that case.
--- Repainting content only, while a gesture owns this window, dodges that
--- entirely -- correct because rows/close-buttons are laid out purely
--- from contentW, which a MOVE never changes; a RESIZE's own release
--- handler already does a full redraw() once the gesture itself is over.
-local function RefreshTaskbar()
-  if not taskbarWin then return end
-  if taskbarWin.dragState or taskbarWin.resizeState then
-    taskbarWin:repaintContent()
-  else
-    taskbarWin:redraw()
-  end
-end
-
-function MwTaskbarRowMouseDown(flags, hotspotId)
-  local id = hotspotId:match("^mw_row_(.+)$")
-  local rec = id and windows[id]
-  if rec and rec.owner then
-    pcall(CallPlugin, rec.owner, "WinframeActivate", id)
-  end
-end
-
-function MwTaskbarCloseMouseDown(flags, hotspotId)
-  local id = hotspotId:match("^mw_close_(.+)$")
-  local rec = id and windows[id]
-  if rec and rec.owner then
-    pcall(CallPlugin, rec.owner, "WinframeHide", id)
+  for i, id in ipairs(ids) do
+    if labels[i] == choice then
+      act(id, not windows[id].visible)
+      return
+    end
   end
 end
 
 -- ---------------------------------------------------------------------------
 -- Window-geometry registry, called into via CallPlugin by winframe.lua
--- (running inside each CONSUMER plugin's own Lua state, including this
--- plugin's own taskbar window -- see the header comment above).
+-- (running inside each CONSUMER plugin's own Lua state -- see the header
+-- comment above).
 -- ---------------------------------------------------------------------------
 
 function WF_Registry_Update(id, left, top, w, h, title, owner, visible)
   windows[id] = { left = left, top = top, w = w, h = h,
     title = title, owner = owner, visible = visible }
-  RefreshTaskbar()
   return true
 end
 
 function WF_Registry_Remove(id)
   windows[id] = nil
-  RefreshTaskbar()
   return true
 end
 
@@ -240,27 +210,17 @@ function WF_Registry_Get(excludeId)
 end
 
 function OnPluginInstall()
-  ColourNote("orange", "", "[mush_windows] ready -- shared window chrome for other plugins in this set.")
+  ColourNote("orange", "", "[mush_windows] ready -- " .. MENU_KEY .. " opens the Windows menu.")
 
-  taskbarWin = winframe.new{
-    id = "mush_windows_taskbar",
-    title = "Windows",
-    min_content_w = 90,
-    min_content_h = ROW_H * 2,
-    default_content_w = 150,
-    default_content_h = ROW_H * 5,
-    on_draw = DrawTaskbar,
-    on_hotspots = TaskbarHotspots,
-  }
-  taskbarWin:show()
+  WindowCreate(MENU_ANCHOR, 0, 0, 1, 1, 12, ABSOLUTE_LOCATION + TRANSPARENT, 0x000000)
+  WindowShow(MENU_ANCHOR, true)
+
+  Accelerator(MENU_KEY, "wf_windows")
 end
 
--- Fallback in case the taskbar's own close button gets used and someone
--- forgets it's just hidden, not gone -- wired to the wf_windows alias
--- below, mirroring the inv_show/inv_hide pattern oerthe_inventory already
--- uses for its own window.
-function WfShowWindows()
-  taskbarWin:show()
+function OnPluginClose()
+  Accelerator(MENU_KEY, "")
+  WindowDelete(MENU_ANCHOR)
 end
 
 ]]>

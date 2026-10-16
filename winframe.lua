@@ -89,8 +89,8 @@ USAGE (from any plugin's own Lua script):
 
     -- The chrome's close (X) button calls win:hide() -- it hides, it does
     -- NOT destroy. Every window (from every plugin) shows up in the shared
-    -- "Windows" list mush_windows itself hosts; clicking an entry there
-    -- brings that window back (calls back into THIS plugin's WinframeActivate,
+    -- "Windows" menu mush_windows itself hosts (Ctrl+Shift+W); picking an
+    -- entry there brings that window back (calls back into THIS plugin's WinframeActivate,
     -- a dispatcher this file installs for you) regardless of which plugin
     -- created it. You don't need to build your own show/hide command for
     -- this specifically, though one doesn't hurt as a fallback.
@@ -174,7 +174,7 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Cross-plugin geometry registry (used for window snapping AND the shared
--- window-list/taskbar window mush_windows itself hosts)
+-- Windows menu mush_windows itself hosts)
 --
 -- mush_windows.xml keeps a small id -> record table and exposes it via
 -- CallPlugin (WF_Registry_Update/Remove/Get), since that's the one place
@@ -186,9 +186,9 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Wrapped in pcall: a registry hiccup should never break dragging itself,
--- only the (purely cosmetic) snapping/taskbar-listing built on top of it.
+-- only the (purely cosmetic) snapping/menu-listing built on top of it.
 -- Title/owner/visibility ride along too (not just geometry) so mush_windows'
--- taskbar window can list every window and know which plugin to call back
+-- Windows menu can list every window and know which plugin to call back
 -- into (WinframeActivate/WinframeHide, below) for a given entry.
 function winframe:syncGeometry()
   pcall(CallPlugin, WINDOWS_PLUGIN_ID, "WF_Registry_Update",
@@ -488,7 +488,7 @@ function winframe:setupHotspots()
 
   local bx = w - BTN_GAP - BTN_SIZE
   WindowAddHotspot(self.win, self.id .. "|btn_close", bx, 2, bx + BTN_SIZE, 2 + BTN_SIZE,
-    "", "", "", "", "WinframeOnButtonClick", "Close (hides the window; bring it back from the windows list)", miniwin.cursor_hand, 0)
+    "", "", "", "", "WinframeOnButtonClick", "Close (hides the window; bring it back with Ctrl+Shift+W)", miniwin.cursor_hand, 0)
   bx = bx - BTN_GAP - BTN_SIZE
   WindowAddHotspot(self.win, self.id .. "|btn_max", bx, 2, bx + BTN_SIZE, 2 + BTN_SIZE,
     "", "", "", "", "WinframeOnButtonClick", "Maximize/restore", miniwin.cursor_hand, 0)
@@ -711,7 +711,7 @@ function winframe:onButtonClick(handle)
     self:redraw()
     self:save()
   elseif handle == "btn_close" then
-    self:hide()  -- hides, doesn't destroy -- bring it back from mush_windows' windows list
+    self:hide()  -- hides, doesn't destroy -- bring it back from mush_windows' Windows menu (Ctrl+Shift+W)
   end
   self:syncGeometry()
 end
@@ -741,8 +741,8 @@ function WinframeOnButtonClick(flags, hotspotId)
   if inst then inst:onButtonClick(handle) end
 end
 
--- Called via CallPlugin from mush_windows' own windows-list/taskbar window
--- when its entry for this id is clicked, to bring the window in THIS plugin
+-- Called via CallPlugin from mush_windows' own Windows menu
+-- when its entry for this id is picked, to bring the window in THIS plugin
 -- forward (and un-minimize/un-hide it) or hide it -- mush_windows only
 -- knows the id and which plugin owns it (from the registry), not the
 -- winframe instance itself, since that only exists in this Lua state.
